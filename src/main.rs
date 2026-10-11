@@ -1,11 +1,12 @@
 use blake3::Hasher;
 use chrono::{DateTime, Datelike, Local, NaiveDate};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use filetime::{set_file_times, FileTime};
+use image::GenericImageView;
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufWriter, Read, Write};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use thiserror::Error;
@@ -35,6 +36,9 @@ struct MoveArgs {
     dry_run: bool,
     #[arg(long, default_value = DEFAULT_UNKNOWN_DIR)]
     unknown_date: PathBuf,
+    /// 同名冲突时的内容比较方式；fast 只比较大小和文件头尾采样
+    #[arg(long, value_enum, default_value_t = CompareMode::Blake3)]
+    compare_mode: CompareMode,
 }
 
 #[derive(Args, Debug)]
@@ -42,6 +46,19 @@ struct UniqueArgs {
     destpath: PathBuf,
     #[arg(long)]
     dry_run: bool,
+    /// 去重时的内容比较方式；fast 只比较大小和文件头尾采样
+    #[arg(long, value_enum, default_value_t = CompareMode::Blake3)]
+    compare_mode: CompareMode,
+    /// 对带编号后缀的图片文件名执行像素相似去重
+    #[arg(long)]
+    image_similarity: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+enum CompareMode {
+    #[default]
+    Blake3,
+    Fast,
 }
 
 #[derive(Debug, Error)]
@@ -212,7 +229,7 @@ fn run_move(args: MoveArgs) -> AppResult<()> {
     }
     validate_unknown_dir(&args.unknown_date)?;
     let _lock = acquire_lock(&dest, args.dry_run)?;
-    let plans = build_move_plans(&src, &dest, &args.unknown_date)?;
+    let plans = build_move_plans(&src, &dest, &args.unknown_date, args.compare_mode)?;
     print_move_plans(&plans);
     if args.dry_run {
         return Ok(());
@@ -273,7 +290,12 @@ struct Counts {
     failed: usize,
 }
 
-fn build_move_plans(src: &Path, dest: &Path, unknown: &Path) -> AppResult<Vec<FilePlan>> {
+fn build_move_plans(
+    src: &Path,
+    dest: &Path,
+    unknown: &Path,
+    compare_mode: CompareMode,
+) -> AppResult<Vec<FilePlan>> {
     let mut files = Vec::new();
     for entry_result in WalkDir::new(src)
         .follow_links(false)
@@ -300,8 +322,8 @@ fn build_move_plans(src: &Path, dest: &Path, unknown: &Path) -> AppResult<Vec<Fi
             .map(|metadata| metadata.file_type().is_file())
             .unwrap_or(false);
         let (target, action) = if target_is_regular_file && !occupied.contains(&base_target) {
-            let source_hash = hash_file(&source)?;
-            let target_hash = hash_file(&base_target)?;
+            let source_hash = compare_fingerprint(&source, compare_mode)?;
+            let target_hash = compare_fingerprint(&base_target, compare_mode)?;
             if source_hash == target_hash {
                 (
                     base_target.clone(),
@@ -459,13 +481,23 @@ fn print_move_plans(plans: &[FilePlan]) {
         let key = plan.target_dir.to_string_lossy().to_string();
         *groups.entry(key).or_default() += 1;
         match &plan.action {
-            PlanAction::Move => plan_logs.push(format!(
-                "[plan] {} -> {}",
-                plan.source.display(),
-                plan.target.display()
-            )),
+            PlanAction::Move => {
+                let source_name = plan.source.file_name();
+                let target_name = plan.target.file_name();
+                let label = if source_name != target_name {
+                    "[plan_surffix]"
+                } else {
+                    "[plan]"
+                };
+                plan_logs.push(format!(
+                    "{} {} -> {}",
+                    label,
+                    plan.source.display(),
+                    plan.target.display()
+                ));
+            }
             PlanAction::SkipSame { existing, hash } => skip_logs.push(format!(
-                "[skip-same] {} skipped; same as {} (BLAKE3 {})",
+                "[skip-same] {} skipped; same as {} (fingerprint {})",
                 plan.source.display(),
                 existing.display(),
                 hash
@@ -594,6 +626,149 @@ fn hash_file(path: &Path) -> AppResult<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
+fn compare_fingerprint(path: &Path, mode: CompareMode) -> AppResult<String> {
+    match mode {
+        CompareMode::Blake3 => hash_file(path),
+        CompareMode::Fast => fast_fingerprint(path),
+    }
+}
+
+const FAST_SAMPLE_BYTES: usize = 64 * 1024;
+
+fn fast_fingerprint(path: &Path) -> AppResult<String> {
+    let metadata = fs::metadata(path).map_err(|e| io_err("读取文件大小", e))?;
+    let size = metadata.len();
+    let sample_len = (size as usize).min(FAST_SAMPLE_BYTES);
+    let mut file = File::open(path).map_err(|e| io_err("打开文件进行快速比较", e))?;
+    let mut head = vec![0u8; sample_len];
+    file.read_exact(&mut head)
+        .map_err(|e| io_err("读取文件头部采样", e))?;
+    let tail_offset = size.saturating_sub(FAST_SAMPLE_BYTES as u64);
+    file.seek(SeekFrom::Start(tail_offset))
+        .map_err(|e| io_err("定位文件尾部采样", e))?;
+    let tail_len = (size - tail_offset) as usize;
+    let mut tail = vec![0u8; tail_len];
+    file.read_exact(&mut tail)
+        .map_err(|e| io_err("读取文件尾部采样", e))?;
+    let mut hasher = Hasher::new();
+    hasher.update(&head);
+    hasher.update(&tail);
+    Ok(format!(
+        "fast:size={size}:sample={}",
+        hasher.finalize().to_hex()
+    ))
+}
+
+fn image_duplicate_groups(
+    files: &[PathBuf],
+    compare_mode: CompareMode,
+) -> AppResult<Vec<(String, Vec<PathBuf>)>> {
+    let mut named: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+    let mut ordinary = Vec::new();
+    for file in files {
+        if let Some(key) = normalized_image_name(file) {
+            named.entry(key).or_default().push(file.clone());
+        } else {
+            ordinary.push(file.clone());
+        }
+    }
+    let mut result = Vec::new();
+    let mut by_hash: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+    for file in ordinary {
+        by_hash
+            .entry(compare_fingerprint(&file, compare_mode)?)
+            .or_default()
+            .push(file);
+    }
+    result.extend(by_hash);
+    for (name, group) in named {
+        if group.len() < 2 {
+            continue;
+        }
+        let mut components: Vec<Vec<PathBuf>> = Vec::new();
+        for file in group {
+            let mut matched = None;
+            for (index, component) in components.iter().enumerate() {
+                let similar = match images_similar(&file, &component[0]) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        eprintln!(
+                            "[image-skip] {} 无法解码，跳过像素比较: {}",
+                            file.display(),
+                            error
+                        );
+                        false
+                    }
+                };
+                if similar {
+                    matched = Some(index);
+                    break;
+                }
+            }
+            if let Some(index) = matched {
+                components[index].push(file);
+            } else {
+                components.push(vec![file]);
+            }
+        }
+        for component in components {
+            if component.len() > 1 {
+                result.push((format!("image:{name}"), component));
+            }
+        }
+    }
+    Ok(result)
+}
+
+fn normalized_image_name(path: &Path) -> Option<String> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    // image crate does not decode HEIC/HEIF in the portable static build;
+    // those files fall back to the ordinary BLAKE3 path.
+    if !matches!(extension.as_str(), "jpg" | "jpeg" | "png" | "webp") {
+        return None;
+    }
+    let stem = path.file_stem()?.to_str()?;
+    let bytes = stem.as_bytes();
+    let close = bytes.len().checked_sub(1)?;
+    if bytes[close] != b')' {
+        return Some(format!("{}.{}", stem.to_ascii_lowercase(), extension));
+    }
+    let open = stem[..close].rfind('(')?;
+    let number = &stem[open + 1..close];
+    if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Some(format!("{}.{}", stem.to_ascii_lowercase(), extension));
+    }
+    let base = stem[..open].trim_end();
+    if base.is_empty() {
+        return None;
+    }
+    Some(format!("{}.{}", base.to_ascii_lowercase(), extension))
+}
+
+fn images_similar(left: &Path, right: &Path) -> AppResult<bool> {
+    let left = image::open(left)
+        .map_err(|e| AppError::Message(format!("读取图片 {}: {e}", left.display())))?;
+    let right = image::open(right)
+        .map_err(|e| AppError::Message(format!("读取图片 {}: {e}", right.display())))?;
+    if left.dimensions() != right.dimensions() {
+        return Ok(false);
+    }
+    let left = left.to_rgba8();
+    let right = right.to_rgba8();
+    let total: u64 = left
+        .pixels()
+        .zip(right.pixels())
+        .map(|(a, b)| {
+            u64::from(a[0].abs_diff(b[0]))
+                + u64::from(a[1].abs_diff(b[1]))
+                + u64::from(a[2].abs_diff(b[2]))
+                + u64::from(a[3].abs_diff(b[3]))
+        })
+        .sum();
+    let pixel_count = u64::from(left.width()) * u64::from(left.height());
+    Ok(total as f64 / (pixel_count as f64 * 4.0) <= 6.0)
+}
+
 fn run_unique(args: UniqueArgs) -> AppResult<()> {
     let dest = fs::canonicalize(&args.destpath).map_err(|e| io_err("读取归档目录", e))?;
     if !dest.is_dir() {
@@ -633,11 +808,19 @@ fn run_unique(args: UniqueArgs) -> AppResult<()> {
     let mut total_delete = 0usize;
     for (group, mut files) in groups {
         files.sort();
-        let mut by_hash: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
-        for file in files {
-            by_hash.entry(hash_file(&file)?).or_default().push(file);
-        }
-        for (hash, mut duplicates) in by_hash {
+        let duplicate_groups = if args.image_similarity {
+            image_duplicate_groups(&files, args.compare_mode)?
+        } else {
+            let mut by_hash: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+            for file in files {
+                by_hash
+                    .entry(compare_fingerprint(&file, args.compare_mode)?)
+                    .or_default()
+                    .push(file);
+            }
+            by_hash.into_iter().collect()
+        };
+        for (hash, mut duplicates) in duplicate_groups {
             if duplicates.len() < 2 {
                 continue;
             }
@@ -647,8 +830,22 @@ fn run_unique(args: UniqueArgs) -> AppResult<()> {
             println!("  keep: {}", keep.display());
             for delete in duplicates.into_iter().skip(1) {
                 if !args.dry_run {
-                    let current_hash = hash_file(&delete)?;
-                    if current_hash != hash {
+                    let unchanged = if hash.starts_with("image:") {
+                        match images_similar(&delete, &keep) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                eprintln!(
+                                    "[image-skip] {} 无法重新解码，跳过回收: {}",
+                                    delete.display(),
+                                    error
+                                );
+                                false
+                            }
+                        }
+                    } else {
+                        compare_fingerprint(&delete, args.compare_mode)? == hash
+                    };
+                    if !unchanged {
                         eprintln!(
                             "[changed-skip] {} 在扫描后内容已变化，跳过回收",
                             delete.display()
