@@ -10,6 +10,35 @@ cargo build --release
 
 生成的程序位于 `target/release/mediabox`。
 
+在 macOS 上为你的 `x86_64` Linux NAS 构建：
+
+```bash
+./build-linux.sh
+```
+
+脚本需要 Docker，只生成本地文件：
+
+```text
+dist/mediabox-linux-x86_64
+```
+
+生成后可手动将该文件复制到 NAS。ARM64 NAS 可使用：
+
+```bash
+MEDIABOX_TARGET=aarch64-unknown-linux-musl \
+DOCKER_PLATFORM=linux/arm64 \
+./build-linux.sh
+```
+
+如果不想启动 Docker daemon，可以使用 Zig 作为 Linux linker：
+
+```bash
+brew install zig
+./build-linux-zig.sh
+```
+
+该脚本同样生成 `dist/mediabox-linux-x86_64`，但需要本机安装 `zig` 和 `rustup`。
+
 ## move：归档文件
 
 递归扫描源目录，将文件移动到 `destpath/year/month`：
@@ -52,7 +81,7 @@ mediabox unique destpath
 mediabox unique destpath --dry-run
 ```
 
-程序会跳过符号链接、`database.bin` 和回收站内容。跨文件系统移动会使用安全的复制后删除流程，并保留基础权限和 `mtime`；ACL、xattr、SELinux label 等扩展属性不主动复制。
+程序会跳过符号链接、`@` 开头的目录（例如 `@eaDir`）、`database.bin` 和回收站内容。跨文件系统移动会使用安全的复制后删除流程，并保留基础权限和 `mtime`；ACL、xattr、SELinux label 等扩展属性不主动复制。
 
 完整设计见 [DESIGN.md](DESIGN.md)。
 

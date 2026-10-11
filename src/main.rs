@@ -9,7 +9,7 @@ use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use thiserror::Error;
-use walkdir::WalkDir;
+use walkdir::{DirEntry, WalkDir};
 
 const DEFAULT_UNKNOWN_DIR: &str = "unknown";
 const TRASH_DIR: &str = ".trash";
@@ -237,24 +237,39 @@ fn run_move(args: MoveArgs) -> AppResult<()> {
         return Ok(());
     }
     let mut counts = Counts::default();
+    let mut moved_logs = Vec::new();
+    let mut failed_logs = Vec::new();
     for plan in plans {
         match plan.action {
             PlanAction::SkipSame { existing, hash } => {
                 if let Err(e) = update_database_for_file(&existing, &hash) {
                     counts.failed += 1;
-                    eprintln!("[failed] 更新 database.bin {}: {}", existing.display(), e);
+                    failed_logs.push(format!(
+                        "[failed] 更新 database.bin {}: {}",
+                        existing.display(),
+                        e
+                    ));
                 } else {
                     counts.skipped += 1;
                 }
             }
             PlanAction::Move => match execute_move(&plan) {
-                Ok(()) => counts.moved += 1,
+                Ok(log) => {
+                    counts.moved += 1;
+                    moved_logs.push(log);
+                }
                 Err(e) => {
                     counts.failed += 1;
-                    eprintln!("[failed] {}: {}", plan.source.display(), e);
+                    failed_logs.push(format!("[failed] {}: {}", plan.source.display(), e));
                 }
             },
         }
+    }
+    for log in moved_logs {
+        println!("{log}");
+    }
+    for log in failed_logs {
+        println!("{log}");
     }
     println!(
         "汇总: moved={}, skipped={}, failed={}",
@@ -288,7 +303,11 @@ struct Counts {
 
 fn build_move_plans(src: &Path, dest: &Path, unknown: &Path) -> AppResult<Vec<FilePlan>> {
     let mut files = Vec::new();
-    for entry_result in WalkDir::new(src).follow_links(false) {
+    for entry_result in WalkDir::new(src)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(should_visit_entry)
+    {
         let entry = entry_result.map_err(|e| AppError::Message(format!("扫描源目录失败: {e}")))?;
         if entry.file_type().is_symlink() || !entry.file_type().is_file() {
             continue;
@@ -385,7 +404,7 @@ fn split_name(name: &str) -> (&str, Option<&str>) {
     (name, None)
 }
 
-fn execute_move(plan: &FilePlan) -> AppResult<()> {
+fn execute_move(plan: &FilePlan) -> AppResult<String> {
     fs::create_dir_all(&plan.target_dir).map_err(|e| io_err("创建目标目录", e))?;
     let final_target = reserve_target(&plan.target)?;
     move_file(&plan.source, &final_target)?;
@@ -410,13 +429,12 @@ fn execute_move(plan: &FilePlan) -> AppResult<()> {
         .to_string();
     db.set(name, hash);
     db.save(&db_path)?;
-    println!(
+    Ok(format!(
         "[moved:{}] {} -> {}",
         plan.date_source.as_str(),
         plan.source.display(),
         final_target.display()
-    );
-    Ok(())
+    ))
 }
 
 fn update_database_for_file(path: &Path, hash: &str) -> AppResult<()> {
@@ -510,22 +528,27 @@ fn copy_then_remove(source: &Path, target: &Path) -> AppResult<()> {
 
 fn print_move_plans(plans: &[FilePlan]) {
     let mut groups: BTreeMap<String, usize> = BTreeMap::new();
+    let mut skip_logs = Vec::new();
+    let mut plan_logs = Vec::new();
     for plan in plans {
         let key = plan.target_dir.to_string_lossy().to_string();
         *groups.entry(key).or_default() += 1;
         match &plan.action {
-            PlanAction::Move => println!(
+            PlanAction::Move => plan_logs.push(format!(
                 "[plan] {} -> {}",
                 plan.source.display(),
                 plan.target.display()
-            ),
-            PlanAction::SkipSame { existing, hash } => println!(
+            )),
+            PlanAction::SkipSame { existing, hash } => skip_logs.push(format!(
                 "[skip-same] {} == {} ({})",
                 plan.source.display(),
                 existing.display(),
                 hash
-            ),
+            )),
         }
+    }
+    for log in skip_logs.into_iter().chain(plan_logs) {
+        println!("{log}");
     }
     println!("计划: {} 个文件，{} 个目标目录", plans.len(), groups.len());
     for (dir, count) in groups {
@@ -656,7 +679,11 @@ fn run_unique(args: UniqueArgs) -> AppResult<()> {
     }
     let _lock = acquire_lock(&dest, args.dry_run)?;
     let mut groups: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
-    for entry_result in WalkDir::new(&dest).follow_links(false) {
+    for entry_result in WalkDir::new(&dest)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(should_visit_entry)
+    {
         let entry =
             entry_result.map_err(|e| AppError::Message(format!("扫描归档目录失败: {e}")))?;
         if entry.file_type().is_symlink() || !entry.file_type().is_file() {
@@ -764,7 +791,12 @@ fn rebuild_database(dir: &Path) -> AppResult<()> {
     let path = dir.join("database.bin");
     let mut db = Database::default();
     if dir.is_dir() {
-        for entry_result in WalkDir::new(dir).min_depth(1).follow_links(false) {
+        for entry_result in WalkDir::new(dir)
+            .min_depth(1)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(should_visit_entry)
+        {
             let entry = entry_result
                 .map_err(|e| AppError::Message(format!("重建 database.bin 失败: {e}")))?;
             if entry.file_type().is_symlink() || !entry.file_type().is_file() {
@@ -783,6 +815,14 @@ fn rebuild_database(dir: &Path) -> AppResult<()> {
         }
     }
     db.save(&path)
+}
+
+fn should_visit_entry(entry: &DirEntry) -> bool {
+    !entry.file_type().is_dir() || !is_ignored_folder_name(entry.file_name())
+}
+
+fn is_ignored_folder_name(name: &OsStr) -> bool {
+    name.to_string_lossy().starts_with('@')
 }
 
 fn escape(value: &str) -> String {
@@ -837,5 +877,12 @@ mod tests {
     fn unknown_directory_must_stay_under_destination() {
         assert!(validate_unknown_dir(Path::new("../outside")).is_err());
         assert!(validate_unknown_dir(Path::new("needs-review")).is_ok());
+    }
+
+    #[test]
+    fn ignores_at_prefixed_directories() {
+        assert!(is_ignored_folder_name(OsStr::new("@eaDir")));
+        assert!(is_ignored_folder_name(OsStr::new("@tmp")));
+        assert!(!is_ignored_folder_name(OsStr::new("2025-07-13")));
     }
 }
