@@ -65,7 +65,7 @@ mediabox move srcpath destpath --unknown-date needs-review
 mediabox move srcpath destpath --dry-run
 ```
 
-目标目录已有同名且内容相同时会跳过；内容不同时会生成 `name (1).ext` 这样的名称。每个归档子目录会维护一个文本 `database.bin`，格式为 `hash<TAB>文件名`。
+move 对普通文件不计算 hash，也不更新 `database.bin`。如果目标目录已有同名文件，会计算源文件和目标文件的 BLAKE3：相同则跳过，不同则生成 `name (1).ext` 这样的新名称，避免覆盖。`unique` 负责归档目录的完整去重和 `database.bin` 更新。
 
 ## unique：归档目录去重
 

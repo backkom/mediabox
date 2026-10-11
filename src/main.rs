@@ -5,7 +5,7 @@ use filetime::{set_file_times, FileTime};
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use thiserror::Error;
@@ -113,25 +113,6 @@ struct Database {
 }
 
 impl Database {
-    fn load(path: &Path) -> AppResult<Self> {
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        let file = File::open(path).map_err(|e| io_err("打开 database.bin", e))?;
-        let mut entries = BTreeMap::new();
-        for (line_no, line) in BufReader::new(file).lines().enumerate() {
-            let line = line.map_err(|e| io_err("读取 database.bin", e))?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            let (hash, escaped_name) = line.split_once('\t').ok_or_else(|| {
-                AppError::Message(format!("database.bin 第 {} 行格式错误", line_no + 1))
-            })?;
-            entries.insert(unescape(escaped_name)?, hash.to_string());
-        }
-        Ok(Self { entries })
-    }
-
     fn set(&mut self, name: String, hash: String) {
         self.entries.insert(name, hash);
     }
@@ -241,17 +222,8 @@ fn run_move(args: MoveArgs) -> AppResult<()> {
     let mut failed_logs = Vec::new();
     for plan in plans {
         match plan.action {
-            PlanAction::SkipSame { existing, hash } => {
-                if let Err(e) = update_database_for_file(&existing, &hash) {
-                    counts.failed += 1;
-                    failed_logs.push(format!(
-                        "[failed] 更新 database.bin {}: {}",
-                        existing.display(),
-                        e
-                    ));
-                } else {
-                    counts.skipped += 1;
-                }
+            PlanAction::SkipSame { .. } => {
+                counts.skipped += 1;
             }
             PlanAction::Move => match execute_move(&plan) {
                 Ok(log) => {
@@ -318,18 +290,16 @@ fn build_move_plans(src: &Path, dest: &Path, unknown: &Path) -> AppResult<Vec<Fi
     let mut occupied = HashSet::new();
     let mut plans = Vec::new();
     for source in files {
-        let (target_dir, date_source, date_error) = match resolve_date(&source, src) {
+        let (target_dir, date_source, _date_error) = match resolve_date(&source, src) {
             Ok(date) => (dest.join(date.dir_name()), date.source, None),
             Err(reason) => (dest.join(unknown), DateSource::Unknown, Some(reason)),
         };
         let base_target =
             target_dir.join(source.file_name().unwrap_or_else(|| OsStr::new("unnamed")));
-        let (target, action) = if date_error.is_some() {
-            (
-                choose_target(&target_dir, &source, &occupied),
-                PlanAction::Move,
-            )
-        } else if base_target.is_file() && !occupied.contains(&base_target) {
+        let target_is_regular_file = fs::symlink_metadata(&base_target)
+            .map(|metadata| metadata.file_type().is_file())
+            .unwrap_or(false);
+        let (target, action) = if target_is_regular_file && !occupied.contains(&base_target) {
             let source_hash = hash_file(&source)?;
             let target_hash = hash_file(&base_target)?;
             if source_hash == target_hash {
@@ -346,11 +316,13 @@ fn build_move_plans(src: &Path, dest: &Path, unknown: &Path) -> AppResult<Vec<Fi
                     PlanAction::Move,
                 )
             }
-        } else {
+        } else if base_target.exists() || occupied.contains(&base_target) {
             (
                 choose_target(&target_dir, &source, &occupied),
                 PlanAction::Move,
             )
+        } else {
+            (base_target, PlanAction::Move)
         };
         if !matches!(action, PlanAction::SkipSame { .. }) {
             occupied.insert(target.clone());
@@ -408,59 +380,12 @@ fn execute_move(plan: &FilePlan) -> AppResult<String> {
     fs::create_dir_all(&plan.target_dir).map_err(|e| io_err("创建目标目录", e))?;
     let final_target = reserve_target(&plan.target)?;
     move_file(&plan.source, &final_target)?;
-    let hash = hash_file(&final_target)?;
-    let db_path = plan.target_dir.join("database.bin");
-    let mut db = match Database::load(&db_path) {
-        Ok(db) => db,
-        Err(error) => {
-            eprintln!(
-                "[database-rebuild] {} 无法读取，将根据当前文件重建: {}",
-                db_path.display(),
-                error
-            );
-            rebuild_database(&plan.target_dir)?;
-            Database::load(&db_path)?
-        }
-    };
-    let name = final_target
-        .file_name()
-        .and_then(OsStr::to_str)
-        .unwrap_or("unnamed")
-        .to_string();
-    db.set(name, hash);
-    db.save(&db_path)?;
     Ok(format!(
         "[moved:{}] {} -> {}",
         plan.date_source.as_str(),
         plan.source.display(),
         final_target.display()
     ))
-}
-
-fn update_database_for_file(path: &Path, hash: &str) -> AppResult<()> {
-    let dir = path
-        .parent()
-        .ok_or_else(|| AppError::Message("目标文件没有父目录".into()))?;
-    let db_path = dir.join("database.bin");
-    let mut db = match Database::load(&db_path) {
-        Ok(db) => db,
-        Err(error) => {
-            eprintln!(
-                "[database-rebuild] {} 无法读取，将根据当前文件重建: {}",
-                db_path.display(),
-                error
-            );
-            rebuild_database(dir)?;
-            Database::load(&db_path)?
-        }
-    };
-    let name = path
-        .file_name()
-        .and_then(OsStr::to_str)
-        .unwrap_or("unnamed")
-        .to_string();
-    db.set(name, hash.to_string());
-    db.save(&db_path)
 }
 
 fn reserve_target(target: &Path) -> AppResult<PathBuf> {
@@ -540,7 +465,7 @@ fn print_move_plans(plans: &[FilePlan]) {
                 plan.target.display()
             )),
             PlanAction::SkipSame { existing, hash } => skip_logs.push(format!(
-                "[skip-same] {} == {} ({})",
+                "[skip-same] {} skipped; same as {} (BLAKE3 {})",
                 plan.source.display(),
                 existing.display(),
                 hash
@@ -833,25 +758,6 @@ fn escape(value: &str) -> String {
         .replace('\r', "\\r")
 }
 
-fn unescape(value: &str) -> AppResult<String> {
-    let mut result = String::new();
-    let mut chars = value.chars();
-    while let Some(ch) = chars.next() {
-        if ch != '\\' {
-            result.push(ch);
-            continue;
-        }
-        match chars.next() {
-            Some('\\') => result.push('\\'),
-            Some('t') => result.push('\t'),
-            Some('n') => result.push('\n'),
-            Some('r') => result.push('\r'),
-            _ => return Err(AppError::Message("database.bin 包含非法转义".into())),
-        }
-    }
-    Ok(result)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -870,7 +776,7 @@ mod tests {
     #[test]
     fn escapes_database_names() {
         let value = "a\tb\nc";
-        assert_eq!(unescape(&escape(value)).unwrap(), value);
+        assert_eq!(escape(value), "a\\tb\\nc");
     }
 
     #[test]
