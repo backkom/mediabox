@@ -3,6 +3,7 @@ use chrono::{DateTime, Datelike, Local, NaiveDate};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use filetime::{set_file_times, FileTime};
 use image::GenericImageView;
+use nom_exif::{Exif, ExifTag, MediaKind, MediaParser, MediaSource, TrackInfoTag};
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
@@ -77,6 +78,8 @@ type AppResult<T> = Result<T, AppError>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DateSource {
+    Exif,
+    VideoCreated,
     Folder,
     Filename,
     Created,
@@ -87,6 +90,8 @@ enum DateSource {
 impl DateSource {
     fn as_str(self) -> &'static str {
         match self {
+            Self::Exif => "exif",
+            Self::VideoCreated => "video-created",
             Self::Folder => "folder",
             Self::Filename => "filename",
             Self::Created => "created",
@@ -537,6 +542,16 @@ fn resolve_date(path: &Path, src_root: &Path) -> Result<ArchiveDate, String> {
             });
         }
     }
+    // 媒体内部的拍摄时间（EXIF DateTimeOriginal、视频 mvhd creation_time）比文件
+    // 系统时间更接近真实拍摄日期，但需要读取文件内容，因此排在目录名和文件名之后：
+    // 名称里已经有日期时就不必打开文件。
+    if let Some(capture) = capture_date(path) {
+        return Ok(ArchiveDate {
+            year: capture.date.year(),
+            month: capture.date.month(),
+            source: capture.source,
+        });
+    }
     let metadata = fs::metadata(path).map_err(|e| format!("读取时间失败: {e}"))?;
     let created = metadata.created().ok();
     let modified = metadata.modified().ok();
@@ -552,6 +567,59 @@ fn resolve_date(path: &Path, src_root: &Path) -> Result<ArchiveDate, String> {
         } else {
             DateSource::Modified
         },
+    })
+}
+
+struct CaptureDate {
+    date: NaiveDate,
+    source: DateSource,
+}
+
+/// 读取媒体文件内部的拍摄时间：图片用 EXIF，视频/音频用容器创建时间。
+/// 解析失败或文件不是可识别的媒体格式时返回 `None`，由调用方回退到其它来源。
+fn capture_date(path: &Path) -> Option<CaptureDate> {
+    let source = MediaSource::open(path).ok()?;
+    let mut parser = MediaParser::new();
+    let (date, source_kind) = match source.kind() {
+        MediaKind::Image => {
+            let exif: Exif = parser.parse_exif(source).ok()?.into();
+            (image_capture_date(&exif)?, DateSource::Exif)
+        }
+        MediaKind::Track => {
+            let track = parser.parse_track(source).ok()?;
+            let value = track.get(TrackInfoTag::CreateDate)?.as_datetime()?;
+            (value.into_naive().date(), DateSource::VideoCreated)
+        }
+    };
+    // 容器或 EXIF 里常出现 0 值时间戳（例如 mvhd 的 creation_time=0 会解出
+    // 1904-01-01）以及相机时钟错误导致的未来时间，这些不应参与归档。
+    if !is_plausible_capture_date(date) {
+        return None;
+    }
+    Some(CaptureDate {
+        date,
+        source: source_kind,
+    })
+}
+
+/// 拍摄时间必须落在可信区间内，否则视为无效元数据。
+fn is_plausible_capture_date(date: NaiveDate) -> bool {
+    const EARLIEST_CAPTURE_YEAR: i32 = 1970;
+    date.year() >= EARLIEST_CAPTURE_YEAR && date.year() <= Local::now().year() + 1
+}
+
+/// 取 EXIF 拍摄时间，优先级为 DateTimeOriginal > CreateDate > ModifyDate。
+fn image_capture_date(exif: &Exif) -> Option<NaiveDate> {
+    let tags = [
+        ExifTag::DateTimeOriginal,
+        ExifTag::CreateDate,
+        ExifTag::ModifyDate,
+    ];
+    tags.into_iter().find_map(|tag| {
+        let value = exif.get(tag)?.as_datetime()?;
+        // 一律使用媒体内记录的本地挂钟时间，不换算时区，这样归档结果不依赖
+        // 运行机器的时区设置。
+        Some(value.into_naive().date())
     })
 }
 
@@ -613,7 +681,8 @@ fn hash_file(path: &Path) -> AppResult<String> {
     let mut file =
         File::open(path).map_err(|e| io_err(format!("打开文件 {}", path.display()), e))?;
     let mut hasher = Hasher::new();
-    let mut buffer = [0u8; 1024 * 1024];
+    // 放在堆上：1 MiB 的栈数组会溢出默认的 1 MiB 主线程栈。
+    let mut buffer = vec![0u8; 1024 * 1024];
     loop {
         let count = file
             .read(&mut buffer)
@@ -958,6 +1027,248 @@ fn escape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 构造一个带 EXIF DateTimeOriginal 的最小 JPEG。
+    /// 注释段用于把文件撑过 MIME 探测使用的 128 字节缓冲。
+    fn exif_jpeg(date_text: &str) -> Vec<u8> {
+        const EXIF_IFD_OFFSET: u32 = 26;
+        const STRING_OFFSET: u32 = 44;
+
+        let mut tiff = Vec::new();
+        tiff.extend_from_slice(b"II");
+        tiff.extend_from_slice(&42u16.to_le_bytes());
+        tiff.extend_from_slice(&8u32.to_le_bytes());
+        // IFD0：一个 ExifOffset 条目，指向 Exif 子 IFD。
+        tiff.extend_from_slice(&1u16.to_le_bytes());
+        tiff.extend_from_slice(&0x8769u16.to_le_bytes());
+        tiff.extend_from_slice(&4u16.to_le_bytes());
+        tiff.extend_from_slice(&1u32.to_le_bytes());
+        tiff.extend_from_slice(&EXIF_IFD_OFFSET.to_le_bytes());
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+        // Exif 子 IFD：一个 DateTimeOriginal 条目。
+        tiff.extend_from_slice(&1u16.to_le_bytes());
+        tiff.extend_from_slice(&0x9003u16.to_le_bytes());
+        tiff.extend_from_slice(&2u16.to_le_bytes());
+        tiff.extend_from_slice(&((date_text.len() + 1) as u32).to_le_bytes());
+        tiff.extend_from_slice(&STRING_OFFSET.to_le_bytes());
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+        tiff.extend_from_slice(date_text.as_bytes());
+        tiff.push(0);
+
+        let mut app1 = b"Exif\0\0".to_vec();
+        app1.extend_from_slice(&tiff);
+
+        let mut jpeg = vec![0xFF, 0xD8];
+        jpeg.extend_from_slice(&[0xFF, 0xE1]);
+        jpeg.extend_from_slice(&((app1.len() + 2) as u16).to_be_bytes());
+        jpeg.extend_from_slice(&app1);
+        let padding = [b' '; 64];
+        jpeg.extend_from_slice(&[0xFF, 0xFE]);
+        jpeg.extend_from_slice(&((padding.len() + 2) as u16).to_be_bytes());
+        jpeg.extend_from_slice(&padding);
+        jpeg.extend_from_slice(&[0xFF, 0xD9]);
+        jpeg
+    }
+
+    /// 构造一个不含 EXIF 的 JPEG（SOI + 注释段 + SOS + EOI）。
+    fn plain_jpeg() -> Vec<u8> {
+        let padding = [b' '; 64];
+        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xFE];
+        jpeg.extend_from_slice(&((padding.len() + 2) as u16).to_be_bytes());
+        jpeg.extend_from_slice(&padding);
+        jpeg.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02, 0xFF, 0xD9]);
+        jpeg
+    }
+
+    /// 构造一个带 moov/mvhd creation_time 的最小 MP4。
+    fn mp4_with_creation_time(creation_time: u32) -> Vec<u8> {
+        let mut mvhd_body = Vec::new();
+        mvhd_body.extend_from_slice(&creation_time.to_be_bytes());
+        mvhd_body.extend_from_slice(&creation_time.to_be_bytes());
+        mvhd_body.extend_from_slice(&1000u32.to_be_bytes());
+        mvhd_body.extend_from_slice(&1000u32.to_be_bytes());
+        mvhd_body.extend_from_slice(&[0u8; 76]);
+        mvhd_body.extend_from_slice(&1u32.to_be_bytes());
+
+        let mut mvhd = Vec::new();
+        mvhd.extend_from_slice(&((12 + mvhd_body.len()) as u32).to_be_bytes());
+        mvhd.extend_from_slice(b"mvhd");
+        mvhd.extend_from_slice(&[0, 0, 0, 0]);
+        mvhd.extend_from_slice(&mvhd_body);
+
+        let mut moov = Vec::new();
+        moov.extend_from_slice(&((8 + mvhd.len()) as u32).to_be_bytes());
+        moov.extend_from_slice(b"moov");
+        moov.extend_from_slice(&mvhd);
+
+        let mut ftyp_body = Vec::new();
+        ftyp_body.extend_from_slice(b"isom");
+        ftyp_body.extend_from_slice(&512u32.to_be_bytes());
+        ftyp_body.extend_from_slice(b"isom");
+
+        let mut file = Vec::new();
+        file.extend_from_slice(&((8 + ftyp_body.len()) as u32).to_be_bytes());
+        file.extend_from_slice(b"ftyp");
+        file.extend_from_slice(&ftyp_body);
+        file.extend_from_slice(&moov);
+        file
+    }
+
+    /// 把 1904 纪元秒数换算为 mp4 使用的 creation_time。
+    fn mp4_epoch_seconds(year: i32, month: u32, day: u32, hour: u32, min: u32, sec: u32) -> u32 {
+        let target = NaiveDate::from_ymd_opt(year, month, day)
+            .unwrap()
+            .and_hms_opt(hour, min, sec)
+            .unwrap();
+        let epoch = NaiveDate::from_ymd_opt(1904, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        (target - epoch).num_seconds() as u32
+    }
+
+    fn write_fixture(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+        let path = dir.join(name);
+        let mut file = File::create(&path).unwrap();
+        file.write_all(bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn reads_exif_capture_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_fixture(dir.path(), "photo.jpg", &exif_jpeg("2020:05:17 19:35:06"));
+        let capture = capture_date(&path).expect("应解析出 EXIF 拍摄时间");
+        assert_eq!(capture.date, NaiveDate::from_ymd_opt(2020, 5, 17).unwrap());
+        assert_eq!(capture.source, DateSource::Exif);
+    }
+
+    #[test]
+    fn reads_video_creation_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let seconds = mp4_epoch_seconds(2021, 8, 9, 10, 11, 12);
+        let path = write_fixture(dir.path(), "clip.mp4", &mp4_with_creation_time(seconds));
+        let capture = capture_date(&path).expect("应解析出视频创建时间");
+        assert_eq!(capture.date, NaiveDate::from_ymd_opt(2021, 8, 9).unwrap());
+        assert_eq!(capture.source, DateSource::VideoCreated);
+    }
+
+    #[test]
+    fn ignores_implausible_video_creation_time() {
+        let dir = tempfile::tempdir().unwrap();
+        // creation_time = 0 会解出 1904-01-01，属于占位值，必须忽略。
+        let path = write_fixture(dir.path(), "zero.mp4", &mp4_with_creation_time(0));
+        assert!(capture_date(&path).is_none());
+    }
+
+    #[test]
+    fn jpeg_without_exif_has_no_capture_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_fixture(dir.path(), "plain.jpg", &plain_jpeg());
+        assert!(capture_date(&path).is_none());
+    }
+
+    #[test]
+    fn non_media_file_has_no_capture_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_fixture(dir.path(), "notes.txt", b"not a photo");
+        assert!(capture_date(&path).is_none());
+    }
+
+    #[test]
+    fn folder_name_outranks_capture_time() {
+        // 名称里已有日期时不应再打开文件读媒体元数据。
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("2019-01-02");
+        fs::create_dir_all(&folder).unwrap();
+        let path = write_fixture(&folder, "plain-name.jpg", &exif_jpeg("2020:05:17 19:35:06"));
+        let resolved = resolve_date(&path, dir.path()).unwrap();
+        assert_eq!(resolved.year, 2019);
+        assert_eq!(resolved.month, 1);
+        assert_eq!(resolved.source, DateSource::Folder);
+    }
+
+    #[test]
+    fn filename_outranks_capture_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_fixture(
+            dir.path(),
+            "IMG_20180304_050607.jpg",
+            &exif_jpeg("2020:05:17 19:35:06"),
+        );
+        let resolved = resolve_date(&path, dir.path()).unwrap();
+        assert_eq!(resolved.year, 2018);
+        assert_eq!(resolved.month, 3);
+        assert_eq!(resolved.source, DateSource::Filename);
+    }
+
+    #[test]
+    fn video_filename_outranks_creation_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let seconds = mp4_epoch_seconds(2021, 8, 9, 10, 11, 12);
+        let path = write_fixture(
+            dir.path(),
+            "VID_20180304_050607.mp4",
+            &mp4_with_creation_time(seconds),
+        );
+        let resolved = resolve_date(&path, dir.path()).unwrap();
+        assert_eq!(resolved.year, 2018);
+        assert_eq!(resolved.month, 3);
+        assert_eq!(resolved.source, DateSource::Filename);
+    }
+
+    #[test]
+    fn capture_time_used_when_names_have_no_date() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_fixture(dir.path(), "DSC_0001.jpg", &exif_jpeg("2020:05:17 19:35:06"));
+        let resolved = resolve_date(&path, dir.path()).unwrap();
+        assert_eq!(resolved.year, 2020);
+        assert_eq!(resolved.month, 5);
+        assert_eq!(resolved.source, DateSource::Exif);
+    }
+
+    #[test]
+    fn video_capture_time_used_when_names_have_no_date() {
+        let dir = tempfile::tempdir().unwrap();
+        let seconds = mp4_epoch_seconds(2021, 8, 9, 10, 11, 12);
+        let path = write_fixture(dir.path(), "clip.mp4", &mp4_with_creation_time(seconds));
+        let resolved = resolve_date(&path, dir.path()).unwrap();
+        assert_eq!(resolved.year, 2021);
+        assert_eq!(resolved.month, 8);
+        assert_eq!(resolved.source, DateSource::VideoCreated);
+    }
+
+    #[test]
+    fn capture_time_outranks_filesystem_time() {
+        // 没有目录名和文件名日期时，媒体拍摄时间优先于文件系统时间。
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_fixture(dir.path(), "DSC_0002.jpg", &exif_jpeg("2020:05:17 19:35:06"));
+        let resolved = resolve_date(&path, dir.path()).unwrap();
+        let filesystem_date = fs::metadata(&path)
+            .unwrap()
+            .created()
+            .or_else(|_| fs::metadata(&path).unwrap().modified())
+            .map(|time| DateTime::<Local>::from(time).date_naive())
+            .unwrap();
+        assert_eq!(resolved.source, DateSource::Exif);
+        // 只有当文件系统日期与 EXIF 日期不同时，该断言才真正验证了优先级。
+        if filesystem_date != NaiveDate::from_ymd_opt(2020, 5, 17).unwrap() {
+            assert_eq!(resolved.year, 2020);
+            assert_eq!(resolved.month, 5);
+        }
+    }
+
+    #[test]
+    fn folder_name_still_used_without_capture_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("2019-01-02");
+        fs::create_dir_all(&folder).unwrap();
+        let path = write_fixture(&folder, "plain.jpg", &plain_jpeg());
+        let resolved = resolve_date(&path, dir.path()).unwrap();
+        assert_eq!(resolved.year, 2019);
+        assert_eq!(resolved.month, 1);
+        assert_eq!(resolved.source, DateSource::Folder);
+    }
 
     #[test]
     fn parses_dates_in_names() {
