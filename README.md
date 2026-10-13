@@ -91,7 +91,7 @@ mediabox move srcpath destpath --compare-mode fast
 
 ## unique：归档目录去重
 
-按每个 `year/month` 子目录（以及 `unknown` 等未知日期目录）单独计算文件 BLAKE3 hash，只保留最老的一份：
+按每个 `year/month` 子目录（以及 `unknown` 等未知日期目录）单独计算文件 BLAKE3 hash，只保留文件名最短的一份（长度相同按文件名排序）：
 
 ```bash
 mediabox unique destpath
@@ -105,7 +105,7 @@ mediabox unique destpath --dry-run
 
 `unique` 也支持相同的 `--compare-mode blake3|fast` 参数；`database.bin` 仍始终保存完整 BLAKE3。
 
-使用 `--image-similarity` 可让 `unique` 将 `IMG_8829.JPG` 和 `IMG_8829(1).JPG` 归为候选组，再比较原始分辨率的像素内容，保留时间最早的文件：
+使用 `--image-similarity` 可让 `unique` 将 `IMG_8829.JPG` 和 `IMG_8829(1).JPG` 归为候选组，再比较原始分辨率的像素内容，保留文件名最短的文件：
 
 ```bash
 mediabox unique destpath --image-similarity

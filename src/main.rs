@@ -9,7 +9,6 @@ use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 use thiserror::Error;
 use walkdir::{DirEntry, WalkDir};
 
@@ -893,7 +892,7 @@ fn run_unique(args: UniqueArgs) -> AppResult<()> {
             if duplicates.len() < 2 {
                 continue;
             }
-            duplicates.sort_by_key(|path| age_key(path));
+            duplicates.sort_by_key(|path| name_length_key(path));
             let keep = duplicates[0].clone();
             println!("[duplicate] {} hash={}", group.display(), hash);
             println!("  keep: {}", keep.display());
@@ -950,14 +949,13 @@ fn group_for_relative(rel: &Path) -> Option<PathBuf> {
     Some(PathBuf::from(first))
 }
 
-fn age_key(path: &Path) -> (SystemTime, String) {
-    let metadata = fs::metadata(path).ok();
-    let time = metadata
-        .as_ref()
-        .and_then(|m| m.created().ok())
-        .or_else(|| metadata.as_ref().and_then(|m| m.modified().ok()))
-        .unwrap_or(SystemTime::UNIX_EPOCH);
-    (time, path.to_string_lossy().to_string())
+/// 去重时保留哪个文件：优先文件名最短的一份，长度相同则按名字字典序。
+fn name_length_key(path: &Path) -> (usize, String) {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default();
+    (name.chars().count(), name)
 }
 
 fn move_to_trash(dest: &Path, source: &Path) -> AppResult<()> {
@@ -1298,5 +1296,21 @@ mod tests {
         assert!(is_ignored_folder_name(OsStr::new("@eaDir")));
         assert!(is_ignored_folder_name(OsStr::new("@tmp")));
         assert!(!is_ignored_folder_name(OsStr::new("2025-07-13")));
+    }
+
+    #[test]
+    fn duplicate_keeps_shortest_name() {
+        // 保留文件名最短的一份，与文件时间无关。
+        let mut duplicates = vec![
+            PathBuf::from("2026/01/IMG_8829(1).JPG"),
+            PathBuf::from("2026/01/IMG_8829.JPG"),
+            PathBuf::from("2026/01/IMG_8829 (2).JPG"),
+        ];
+        duplicates.sort_by_key(|path| name_length_key(path));
+        assert_eq!(duplicates[0], PathBuf::from("2026/01/IMG_8829.JPG"));
+        // 长度相同时按名字字典序稳定选择。
+        assert_eq!(name_length_key(Path::new("a/b.jpg")), (5, "b.jpg".to_string()));
+        // 计数按字符数而非字节数，非 ASCII 名字不会被高估。
+        assert_eq!(name_length_key(Path::new("照片.jpg")).0, 6);
     }
 }
